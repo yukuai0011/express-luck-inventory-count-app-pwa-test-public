@@ -1,11 +1,32 @@
 # Deno
 # https://deno.com/
-
-# Cache directory (when using project-local DENO_DIR)
-# https://docs.deno.com/runtime/fundamentals/setup/#deno_dir
 .deno/
 
+# Node.js
+node_modules/
+*.log
+*.lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Nuxt (PWA build output)
+pwa/.nuxt/
+pwa/.output/
+pwa/.data/
+.nuxt/
+.output/
+
 # Coverage reports
-# https://docs.deno.com/runtime/reference/cli/coverage/
 coverage/
 *.lcov
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
