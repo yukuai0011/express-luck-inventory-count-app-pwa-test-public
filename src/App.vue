@@ -1,8 +1,32 @@
-<script setup>
+<script setup lang="ts">
+import { BrowserMultiFormatReader } from '@zxing/browser';
 import { computed, onMounted, ref, watch } from 'vue';
 
+type ScannedInfo = {
+  orderNo: string;
+  recordingNo: number;
+  locationCode: string;
+};
+
+type Profile = {
+  apiEndpoint: string;
+  orderNo: string;
+  recordingNo: number;
+  locationCode: string;
+  bearerToken: string | null;
+};
+
+type OutboxEntry = {
+  url: string;
+  headers: {
+    Authorization: string | null;
+  };
+  payload: Record<string, unknown>;
+  ts: string;
+};
+
 const scannedApi = ref('');
-const scannedInfo = ref(null);
+const scannedInfo = ref<ScannedInfo | null>(null);
 const pasteJson = ref('');
 const bearerToken = ref('');
 
@@ -11,29 +35,28 @@ const intact = ref(true);
 const quantity = ref(0);
 const result = ref('');
 
-const profile = ref(null);
-const outbox = ref([]);
+const profile = ref<Profile | null>(null);
+const outbox = ref<OutboxEntry[]>([]);
 
 const toastMessage = ref('');
 const toastTone = ref('info');
-let toastTimer;
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
-const scanDialog = ref(null);
-const scanVideo = ref(null);
+const scanDialog = ref<HTMLDialogElement | null>(null);
+const scanVideo = ref<HTMLVideoElement | null>(null);
 const scanError = ref('');
 const scanMode = ref('qr');
 const scanning = ref(false);
-let stream = null;
-let detector = null;
-let rafId = null;
+let stream: MediaStream | null = null;
+let detector: BarcodeDetector | null = null;
+let rafId: number | null = null;
+let zxingReader: BrowserMultiFormatReader | null = null;
+let zxingControls: { stop: () => void } | null = null;
 
 const hasBothScans = computed(() => Boolean(scannedApi.value) && Boolean(scannedInfo.value));
 const cameraSupported = computed(() => {
   if (typeof globalThis === 'undefined') return false;
-  return Boolean(
-    'BarcodeDetector' in globalThis &&
-      globalThis.navigator?.mediaDevices?.getUserMedia
-  );
+  return Boolean(globalThis.navigator?.mediaDevices?.getUserMedia);
 });
 
 const profileSummary = computed(() => {
@@ -60,7 +83,7 @@ onMounted(() => {
 function loadProfile() {
   try {
     const raw = localStorage.getItem('profile');
-    if (raw) profile.value = JSON.parse(raw);
+    if (raw) profile.value = JSON.parse(raw) as Profile;
   } catch {
     profile.value = null;
   }
@@ -80,7 +103,7 @@ function clearProfile() {
 function loadOutbox() {
   try {
     const raw = localStorage.getItem('outbox');
-    outbox.value = raw ? JSON.parse(raw) : [];
+    outbox.value = raw ? (JSON.parse(raw) as OutboxEntry[]) : [];
   } catch {
     outbox.value = [];
   }
@@ -105,9 +128,9 @@ function detectPastedJson() {
 }
 
 function handleQrText(text) {
-  let obj;
+  let obj: Record<string, unknown>;
   try {
-    obj = JSON.parse(text);
+    obj = JSON.parse(text) as Record<string, unknown>;
   } catch {
     return false;
   }
@@ -135,11 +158,13 @@ function handleQrText(text) {
 
 function saveProfile() {
   if (!hasBothScans.value) return;
+  const info = scannedInfo.value;
+  if (!info) return;
   const nextProfile = {
     apiEndpoint: scannedApi.value,
-    orderNo: scannedInfo.value.orderNo,
-    recordingNo: scannedInfo.value.recordingNo,
-    locationCode: scannedInfo.value.locationCode,
+    orderNo: info.orderNo,
+    recordingNo: info.recordingNo,
+    locationCode: info.locationCode,
     bearerToken: bearerToken.value.trim() || null
   };
   saveProfileToStorage(nextProfile);
@@ -148,7 +173,8 @@ function saveProfile() {
 
 async function submit() {
   result.value = '';
-  if (!profile.value) {
+  const currentProfile = profile.value;
+  if (!currentProfile) {
     showToast('No profile saved. Please create and save a profile first.', 'warning');
     return;
   }
@@ -159,16 +185,16 @@ async function submit() {
     return;
   }
 
-  const url = sanitizeEndpoint(profile.value.apiEndpoint ?? '');
+  const url = sanitizeEndpoint(currentProfile.apiEndpoint ?? '');
   if (!url.startsWith('http')) {
     showToast('Profile API endpoint is invalid.', 'warning');
     return;
   }
 
   const payload = {
-    orderNo: profile.value.orderNo,
-    recordingNo: profile.value.recordingNo,
-    locationCode: profile.value.locationCode,
+    orderNo: currentProfile.orderNo,
+    recordingNo: currentProfile.recordingNo,
+    locationCode: currentProfile.locationCode,
     packageNo: pkg,
     quantity: intact.value ? 0 : quantity.value,
     packageIntact: intact.value
@@ -180,8 +206,8 @@ async function submit() {
       Accept: 'application/json',
       'x-ms-client-tracking-id': uuidv4()
     };
-    if (profile.value.bearerToken) {
-      headers.Authorization = `Bearer ${profile.value.bearerToken}`;
+    if (currentProfile.bearerToken) {
+      headers.Authorization = `Bearer ${currentProfile.bearerToken}`;
     }
 
     const response = await fetch(url, {
@@ -199,17 +225,18 @@ async function submit() {
       `Response:\n${JSON.stringify({ status: response.status, ok: response.ok, body }, null, 2)}`
     ].join('\n\n');
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     const entry = {
       url,
       headers: {
-        Authorization: profile.value.bearerToken ? `Bearer ${profile.value.bearerToken}` : null
+        Authorization: currentProfile.bearerToken ? `Bearer ${currentProfile.bearerToken}` : null
       },
-      payload,
+      payload: payload as Record<string, unknown>,
       ts: new Date().toISOString()
     };
     outbox.value.push(entry);
     saveOutbox();
-    result.value = `Request failed (likely offline). Saved to queue.\n${error}`;
+    result.value = `Request failed (likely offline). Saved to queue.\n${message}`;
   }
 }
 
@@ -299,7 +326,11 @@ function showToast(message, tone = 'info') {
 
 function openScan(mode) {
   if (!cameraSupported.value) {
-    showToast('Camera scanning needs BarcodeDetector support. Please paste JSON or type the package number.', 'info');
+    showToast('Camera scanning needs HTTPS and camera permission. Please paste JSON or type the package number.', 'info');
+    return;
+  }
+  if (!globalThis.isSecureContext) {
+    showToast('Camera scanning requires HTTPS (GitHub Pages is OK).', 'info');
     return;
   }
   scanMode.value = mode;
@@ -311,30 +342,69 @@ function openScan(mode) {
 async function startScan() {
   try {
     scanning.value = true;
-    const formats = scanMode.value === 'qr'
-      ? ['qr_code']
-      : ['code_128', 'ean_13', 'ean_8', 'code_39', 'upc_a', 'upc_e', 'itf', 'codabar'];
-
-    detector = new BarcodeDetector({ formats });
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment' },
-      audio: false
-    });
-
-    if (scanVideo.value) {
-      scanVideo.value.srcObject = stream;
-      await scanVideo.value.play();
+    if (nativeDetectorSupported()) {
+      await startNativeScan();
+    } else {
+      await startZxingScan();
     }
-
-    await detectLoop();
   } catch (error) {
     scanError.value = `Unable to access camera. ${error}`;
     stopScan();
   }
 }
 
+function nativeDetectorSupported() {
+  return typeof globalThis !== 'undefined' && 'BarcodeDetector' in globalThis;
+}
+
+async function startNativeScan() {
+  const formats = scanMode.value === 'qr'
+    ? ['qr_code']
+    : ['code_128', 'ean_13', 'ean_8', 'code_39', 'upc_a', 'upc_e', 'itf', 'codabar'];
+
+  detector = new BarcodeDetector({ formats });
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'environment' },
+    audio: false
+  });
+
+  if (scanVideo.value) {
+    scanVideo.value.srcObject = stream;
+    await scanVideo.value.play();
+  }
+
+  await detectLoop();
+}
+
+async function startZxingScan() {
+  if (!scanVideo.value) return;
+  if (!zxingReader) zxingReader = new BrowserMultiFormatReader();
+
+  const controls = await zxingReader.decodeFromVideoDevice(
+    undefined,
+    scanVideo.value,
+    (result, error, decodeControls) => {
+      if (decodeControls && !zxingControls) zxingControls = decodeControls;
+      if (result) {
+        const text = typeof result.getText === 'function'
+          ? result.getText()
+          : (result as { text?: string }).text ?? `${result}`;
+        handleScanResult(text);
+      }
+      if (error) {
+        const name = (error as { name?: string } | null)?.name;
+        if (name !== 'NotFoundException') {
+          scanError.value = `Scanning error: ${String(error)}`;
+        }
+      }
+    }
+  );
+
+  if (controls && !zxingControls) zxingControls = controls;
+}
+
 async function detectLoop() {
-  if (!scanning.value || !scanVideo.value) return;
+  if (!scanning.value || !scanVideo.value || !detector) return;
   try {
     const barcodes = await detector.detect(scanVideo.value);
     if (barcodes.length) {
@@ -370,6 +440,14 @@ function stopScan() {
   scanning.value = false;
   if (rafId) cancelAnimationFrame(rafId);
   rafId = null;
+  detector = null;
+  if (zxingControls) {
+    zxingControls.stop();
+    zxingControls = null;
+  }
+  if (zxingReader) {
+    zxingReader.reset();
+  }
   if (stream) {
     stream.getTracks().forEach((track) => track.stop());
     stream = null;
@@ -490,7 +568,7 @@ function stopScan() {
         <video ref="scanVideo" class="aspect-video w-full rounded-lg bg-base-300" playsinline></video>
         <p v-if="scanError" class="text-sm text-error">{{ scanError }}</p>
         <p v-else class="text-xs opacity-70">
-          Tip: Use HTTPS (GitHub Pages is OK) and allow camera permission in your browser.
+          Tip: Use HTTPS (GitHub Pages is OK) and allow camera permission in your browser. On iOS, use Safari and ensure camera permission is enabled.
         </p>
         <div class="modal-action">
           <button class="btn" @click="stopScan(); scanDialog.close()">Stop</button>
